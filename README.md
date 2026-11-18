@@ -1,14 +1,8 @@
 # Fine-tuning a local LLM on medical reasoning data — a case study in why it didn't work
 
-A hands-on experiment: QLoRA fine-tune `Qwen/Qwen3.5-4B` on a medical reasoning
-dataset, measure before/after quality with an LLM judge, and find out *why*
-the result wasn't what a clean loss curve suggested.
+นี่คือโปรเจคที่ทำมาเพื่อเรียนรู้เกี่ยวกับการเทรน SML( 4B) ผ่าน SFT ในระดับ 8-24GB cuda เพื่อดูว่าสามารถรันได้ดีเเค่ไหน
+- code ถูก gen โดน claude sonnet 5, high effort
 
-**Headline finding: the fine-tune taught the model to sound like a careful
-clinical reasoner, including fabricating plausible-sounding details with
-total confidence, without making it meaningfully more correct.** Independent
-fact-checking of the training data itself turned out to be the main reason
-why, and that fact-check needed its own sanity-checking too.
 
 No trained model weights are included — the adapter was lost when the rented
 GPU pod was terminated before it could be copied off. Everything else
@@ -21,7 +15,7 @@ GPU pod was terminated before it could be copied off. Everything else
 - **Data:** [`YuSun-AI/ReasonMed`](https://huggingface.co/datasets/YuSun-AI/ReasonMed) — 300 train / 30 held-out eval, disjoint, seeded shuffle
 - **Hardware:** rented RunPod GPU (RTX 4090 → RTX PRO 4500 Blackwell, 32GB)
 - **Judge:** DeepSeek Flash API, scoring 0-5 on correctness / logical coherence / faithfulness / hallucination-free / omission-free
-- **Training:** 3 epochs, 114 optimizer steps, ~79 minutes
+- **Training:** 3 epochs, 114 optimizer steps, ~79 minutes เสียเงินไปสุทธิเกือบ 2 dollars
 
 ## Pipeline
 
@@ -47,27 +41,18 @@ Run order is: `data_prep.py` → `generate.py` (baseline) → `judge.py` → `tr
 | hallucination_free | 3.27 | 2.76 | **-0.51** |
 | omission_free | 2.50 | 2.38 | -0.12 |
 
-Correctness barely moved. Everything else got *worse* — most notably
-hallucination. The training loss, meanwhile, looked completely normal: a
-sharp drop from 2.15 to ~0.39 in the first 10 steps, then a stable plateau
-around 0.24-0.32 for the rest of training. **A good loss curve told us
-nothing about whether the model actually got better.**
+10 steps เเรกลด accuracy loss จาก 2 -> 0.39 เเละ plateau ในช่วงนั้นตลอดการเทรน
+**ดูเหมือนจะดี** เเต่ว่า loss ไม่สามรถ capture เนื้อความ free text ได้จากที่เห็นว่า eval ผ่าน LLM judge พบว่า score ลดทุก metrics
+นั่นเพราะว่ามันได้ representation learning สไตล์มากกว่าสิ่งที่เราต้องการคือความถูกต้อง
 
 ## What was actually happening (read the full outputs in `data/`)
 
 Pulling up real pre/post response pairs showed the mechanism directly:
 
-- **Structural mimicry was near-perfect.** The post-train model reproduces
-  ReasonMed's exact document template (*Restated Question → Key Details →
+- **Structural mimicry was near-perfect.** Post-trained model มีสไตล์การพูดเหมือนกับตัว label (*Restated Question → Key Details →
   Pathophysiologic Basis → Option-by-Option Analysis → Differential
-  Comparison → Final Justification → Clinical Pearls*) almost verbatim,
-  despite the base model never using this structure at all.
-- **The content inside that structure was confidently fabricated.** On one
-  question about a femur fracture, the post-train model invented an entire
-  plausible-sounding argument based on the wrong anatomy (claiming AO/OTA 31
-  fractures are proximal *humerus* fractures; they're proximal *femur*) —
-  while still landing on the correct final answer letter by pattern-matching,
-  not by reasoning correctly.
+  Comparison → Final Justification → Clinical Pearls*) เเต่ดูเหมือนมันไมไ่ด้ใช้มาคิดคำตอบเลย
+- **The content inside that structure was confidently fabricated.**สำหรับคำถามหนึ่งเกี่ยวกับภาวะกระดูกต้นขาหัก (femur fracture) โมเดลที่ผ่านการปรับจูนแล้ว (post-train model) ได้กุเหตุผลทั้งหมดที่ฟังดูน่าเชื่อถือขึ้นมาจากกายวิภาคที่ผิดเพี้ยน (โดยอ้างว่ากระดูกหักรหัส AO/OTA 31 คือกระดูกต้นแขนส่วนต้นหัก หรือ proximal humerus fractures ทั้งที่ความจริงคือกระดูกต้นขาส่วนต้นหัก หรือ proximal femur) — แต่กลับยังเลือกตัวเลือกคำตอบสุดท้ายได้ถูกต้องด้วยการจับแพทเทิร์น (pattern-matching) ไม่ใช่จากการให้เหตุผลที่ถูกต้อง
 - **A dataset-generation artifact leaked directly into the model's
   hallucinations.** Some ReasonMed labels contain leftover
   "Corrections from Error Feedback" text (apparently a draft-then-correct
@@ -112,29 +97,7 @@ error, plus the structurally-detectable artifact contamination), just not
 exactly quantifiable from one scoring pass. Any eval/filter built on an LLM
 judge needs its own spot-checking before you trust the numbers.
 
-## Engineering lessons (separate from the ML result)
-
-- **Progress visibility doesn't happen by default.** `print()`/tqdm output
-  silently buffers over SSH; without `flush=True` and incremental writes, a
-  process can run for 40+ minutes with zero signal it's even alive.
-- **"Thinking mode" is a silent trap, on both ends of the stack.** Not
-  passing `enable_thinking=False` to Qwen3.5 blew up generation time 10x+ on
-  hidden reasoning. The exact same failure mode hit `deepseek-flash` during
-  judging — its hidden `reasoning_content` silently ate the entire
-  `max_tokens` budget, producing empty responses, until `thinking:
-  {"type": "disabled"}` was set explicitly.
-- **Bleeding-edge models outrun their own ecosystem.** Qwen3.5's
-  Mamba-hybrid layers wanted `causal_conv1d`/`flash-linear-attention`, but
-  prebuilt wheels didn't match this pod's torch/CUDA build — a real,
-  time-costly mismatch, not worth chasing for a one-off experiment.
-- **Checkpoint early and often, and copy artifacts off the rented box
-  immediately.** The trained adapter was lost entirely because the pod got
-  terminated (not just stopped) before the 85MB adapter file was pulled
-  down — an easily avoidable loss.
-- **A successful `pip install` doesn't mean a working import** for anything
-  with compiled CUDA extensions — always smoke-test immediately.
-
-## ML lessons
+##สิ่งที่ได้จากการทำโปรเจคนี้
 
 1. **Loss going down ≠ the model getting better at the task.** It only
    measures "predicts this exact label," not "is correct" or "is a good
@@ -155,7 +118,7 @@ judge needs its own spot-checking before you trust the numbers.
    independently spot-check it before trusting its verdicts, the same way
    you'd spot-check the model you're evaluating.
 
-## If this were attempted again
+##ในครั้งหน้าจะทำเพิ่ม
 
 Filter training data by a *verified* subset (not just the raw judge flag),
 strip the self-correction artifacts, narrow to one subdomain for repeated
